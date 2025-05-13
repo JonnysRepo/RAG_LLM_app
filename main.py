@@ -270,59 +270,143 @@ def format_documents(docs):
 
 # Define the function that calls the model
 class LLMModelManager:
-    def __init__(self, dir_path, document_force_reload=False):
-        logger.info('Initialising LLMModelManger')
-        self.llm = LLM()
-        logger.info('LLM initialised')
-        self.embeddings = Embeddings()
-        logger.info('Embeddings object created')
-        self.embeddings.load_documents(directory_path=dir_path, force_reload=document_force_reload)
-        self.prompt = self._create_prompt()
-        self.runnable = self.prompt | self.llm.HF_pipeline
+    """Manages LLM inference, RAG embeddings, and session state for conversational AI.
 
-    def _create_prompt(self):
-        return ChatPromptTemplate.from_messages([
-            ("system",
-             "### STRICT Answer Format Requirement: You MUST format your response EXACTLY as follows, with no deviations:\n\n### Thought Process:\n[Your step-by-step reasoning here]\n\n### Final Answer:\n[Your concise answer here]\n\nDo NOT include additional text, repeat the question, or deviate from this structure."),
-            ("system",
-             "### Instructions: Answer only the question provided. Before answering, think step by step and explain your reasoning in the 'Thought Process' section. Provide a concise answer in the 'Final Answer' section. Example:\n\nQuestion: What is 2+2?\nResponse:\n### Thought Process:\nFirst, I identify the numbers: 2 and 2. Then, I add them together: 2 + 2 = 4.\n\n### Final Answer:\n4"),
-            ("system", "### Language Instructions: Respond in {language}."),
-            ("system", "### Retrieved and Ranked Documents relevant to the question:\n{documents}."),
-            MessagesPlaceholder(variable_name="messages"),
-            ("user", "### User Question:\n{question}"),
-        ])
+    Supports local models.
+    Integrates RAG for context-aware responses and handles session-specific documents.
 
-    def call_model(self, state: BaseModel):
-        # Extract relevant fields from the state
-        documents = state.documents if state.documents else ""
-        language = state.language if state.language else ""
-        question = state.question
-        messages = state.messages if state.messages else []
+    Args:
+        model_type (str): 'local'.
+        HF_model_id (str, optional): Hugging Face model ID. Defaults to CONFIG setting.
+        document_force_reload (bool): Force reload RAG documents.
 
-        formatted_docs = self.embeddings.get_documents(question, top_k=20)
-        state.documents = formatted_docs  # UPDATE IF A FILE IS UPLOADED FROM FRONTEND
+    Raises:
+        ValueError: If model_type is invalid or required parameters are missing.
+        HTTPException: If LLM initialization fails.
+    """
 
-        # format prompt to LLM
-        input_dict = {
-            "documents": formatted_docs,
-            "language": language,
-            "question": question,
-            "messages": messages,
-            "response": ""
-        }
-        print(input_dict)
+    def __init__(self,
+                 model_type: str,
+                 HF_model_id: str = CONFIG["model"]["local_model"]["default_local_model_HF_ID"],
+                 document_force_reload: bool = False
+                 ):
+        self.vector_store_manager = None
+        self.model_type = model_type.lower()
+        if self.model_type not in self.SUPPORTED_MODEL_TYPES:
+            raise ValueError(f"Invalid model_type: {model_type}. Must be one of {self.SUPPORTED_MODEL_TYPES}")
+
+        logger.info(f'Initializing LLMModelManager with model_type={model_type}')
+
+        self.HF_model_id = HF_model_id
+        self.local_llm = None
+        self.document_force_reload = document_force_reload
+
+        self.default_prompt = CONFIG["model"]["default_context_prompt"]
+        self.max_threads_per_user = CONFIG["model_manager"]["max_threads_per_user"]
+        self.http_client = httpx.AsyncClient(
+            timeout=CONFIG["model_manager"]["http_timeout"],
+            verify=True,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+        )
+
+    @classmethod
+    async def create(cls, **kwargs):
+        """Cannot call async function in init - use async factory and initiate instance using this"""
+        self = cls(**kwargs)
+        # Initialise locally hosted model
+        if self.model_type == 'local':
+            try:
+                logger.info(f"Creating LLM instance for {self.model_type}")
+                loop = asyncio.get_running_loop()
+                self.local_llm = await loop.run_in_executor(_executor, lambda: LLM(HF_model_id=self.HF_model_id))
+                logger.info(f"LLM instance created: {self.model_type}")
+            except Exception as e:
+                logger.error(f"LLM initialization failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Local LLM initialization failed: {str(e)}")
+        elif self.model_type == 'openrouter':
+            if not self.openrouter_api_key or not self.openrouter_model:
+                raise ValueError("OpenRouter API key and model name are required")
+
+        self.vector_store_manager = VectorStoreManager()
+        await self.vector_store_manager.initialise()
+
+        logger.info("LLMModelManager initialized")
+        return self
+
+    @staticmethod
+    def _create_prompt(step: str) -> ChatPromptTemplate:
+        """
+        Create a prompt template for the LLM, including session and RAG documents.
+
+        Returns:
+            A ChatPromptTemplate with placeholders for messages and question.
+        """
+
+        if step in ['decide_web_search', 'query_optimiser']:
+            return ChatPromptTemplate([
+                ('system', '{system_prompt}'),
+                ('system', '<background_knowledge_documents>{rag_documents}</background_knowledge_documents>'),
+                ('system', '<web_search_results>{web_search_results}</web_search_results>'),
+                ('system', '<user_uploaded_documents>{session_documents}</user_uploaded_documents>'),
+                ('system', '<older_message_summary>{older_message_summary}</older_message_summary>'),
+                MessagesPlaceholder(variable_name="messages"),
+                ('system', '<user_question>{question}</user_question>')
+            ])
+        elif step == 'question':
+            return ChatPromptTemplate([
+                ('system', '{system_prompt}'),
+                ('system', '<session_context>{system_information}</session_context>'),
+                ('system', '<background_knowledge_documents>{rag_documents}</background_knowledge_documents>'),
+                ('system', '<web_search_results>{web_search_results}</web_search_results>'),
+                ('system', '<user_uploaded_documents>{session_documents}</user_uploaded_documents>'),
+                ('system', '<older_message_summary>{older_message_summary}</older_message_summary>'),
+                MessagesPlaceholder(variable_name="messages"),
+                ('system', '<user_question>{question}</user_question>')
+            ])
+        else:
+            return ChatPromptTemplate([
+                ('system', '{system_prompt}'),
+                ('system', '<older_message_summary>{older_message_summary}</older_message_summary>'),
+                MessagesPlaceholder(variable_name="messages")
+            ])
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)),
+        before=lambda _: logger.debug("Attempting to generate response"),
+        after=lambda rs: logger.debug(f"Attempt {rs.attempt_number} completed with outcome: {rs.outcome}")
+    )
+    async def generate(self, messages, model, step) -> str | Dict:
+        """Generate text asynchronously based on the prompt using local model"""
         try:
-            response = self.runnable.invoke(input_dict)
-            response_text = response.content if hasattr(response, 'content') else response
+            # Ensure pipeline is initialized
+            if not self.local_llm.HF_pipeline:
+                logger.error("Local pipeline not initialized")
+                raise ValueError("Local pipeline not initialized")
+
+            # Convert messages to a string prompt
+            prompt = self._format_messages_to_string(messages)
+            logger.debug(f"Formatted prompt: {prompt}")
+
+            # Run pipeline in a thread to avoid blocking
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(_executor, self.local_llm.generate, prompt)
+
+            if isinstance(response, list) and len(response) > 0:
+                response = response[0].get('generated_text', '').strip()
+            elif isinstance(response, str):
+                response = response.strip()
+            else:
+                logger.error(f"Unexpected local response format: {response}")
+                raise ValueError("Invalid response from local pipeline")
+
+            logger.debug(f"Local response: {response}")
+            return response
+
         except Exception as e:
-            logger.error(f"Model invocation failed: {e}")
-            raise HTTPException(status_code=500, detail="Model invocation failed.")
-
-        reasoning, answer = parse_response(response_text)
-        user_message = HumanMessage(content=question)
-        ai_response = AIMessage(content=f"### Thought Process:\n{reasoning}\n\n### Final Answer:\n{answer}")
-
-        return {"messages": [user_message, ai_response]}
+            logger.error(f"Local model generation failed: {e}")
+            raise
 
 
 class State(BaseModel):
@@ -331,16 +415,9 @@ class State(BaseModel):
     question: str
     documents: Optional[str] = None
 
-
 # Create a single shared instance of LLMModelManager and Graph
 shared_model_manager = LLMModelManager(dir_path='data', document_force_reload=True)
-workflow = StateGraph(state_schema=State)
-workflow.add_edge(START, "model")
-workflow.add_node("model", shared_model_manager.call_model)
-
-# Add memory
-memory = MemorySaver()
-llm_app = workflow.compile(checkpointer=memory)
+workflow = create_workflow(shared_model_manager)
 
 
 def get_model_manager():
